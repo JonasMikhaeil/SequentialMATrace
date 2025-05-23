@@ -1,0 +1,265 @@
+```{r}
+library(dplyr)
+library(tidyverse)
+library(fastDummies)
+library(cmdstanr)
+options(mc.cores = parallel::detectCores())
+set.seed(12345)
+```
+
+
+
+### Method
+
+
+```{r,warning=FALSE,message=FALSE}
+
+smat <- function(data, prior) {
+  ### INPUT:
+  ### data: (data.frame)
+  ### data$y: study outcomes, data$se: study standard errors
+  ### data$t: position of study in the sequence
+  ### data$method: Variable with a factor level for each method (K:number of methods)
+  ### data$method_1: dummy variable that is 1 if the study is performed with method 1
+  ### ...
+  ### data$method_K: dummy variable that is 1 if the study is performed with method 1
+  ### It is IMPORTANT that the K-dummy variables are the last columns in the data.frame
+  
+  ###  prior: (matrix) dim: number of sudies x number of methods
+  ###  element prior[t,k] : kappa_{method k,t}
+  ###  kappa_{method,t} is our believe about the potential bias of method k at time t
+  
+  collective_posterior <-
+    get_collective_posterior_sequence(data, prior)
+  W2_seq <- calculate_W2_sequence(collective_posterior)
+  estm_seq <- calculate_posterior_estimates(collective_posterior)
+  plot1 <- plot_data(data)
+  plot2 <- plot_estimate_seq(estm_seq)
+  plot3 <- plot_W2_seq(W2_seq)
+  plot <-gridExtra::grid.arrange(plot1, plot2, plot3, nrow = 1)
+  plot
+}
+
+get_collective_posterior_sequence <- function(data, prior) {
+  ### run STAN model of the labelled Random Effect model to 
+  ### and return the sequence of collective posteriors
+  collective_posterior <- NULL
+  LRE <- cmdstan_model("SMAT.stan")
+  
+  num_methods <- length(levels(as.factor(data$method)))
+  seq_length <- length(levels(as.factor(data$t)))
+  for (i in 1:seq_length) {
+    if(i %% 10 == 0 || i==1){
+      print(sprintf("Progress: %.1f%%", 100 * i / seq_length))}
+    data_i <- data %>% filter(t <= i)
+    X <- data_i %>%
+      select(tail(everything(), num_methods))
+    fit_LRE <- LRE$sample(
+      data = list(
+        N = length(data_i$y),
+        m = num_methods,
+        y = data_i$y,
+        sigma_hat = data_i$se,
+        label = X,
+        sig_m = prior[i, ]
+      ),
+      seed = 123,
+      chains = 4,
+      parallel_chains = 4,
+      refresh = 0,
+      iter_sampling = 10000,
+      show_messages  = FALSE,
+      show_exceptions = FALSE
+    )
+    
+    draws_LRE <- fit_LRE$draws(variables = "mu",
+                               inc_warmup = FALSE)
+    if (summary(draws_LRE)["rhat"] > 1.1)
+      print(summary(draws_LRE))
+    collective_posterior <-
+      rbind(collective_posterior,
+            data.frame(
+              mu = posterior::as_draws_matrix(draws_LRE),
+              seq = i
+            ))
+  }
+  collective_posterior
+}
+calculate_W2_sequence <- function(collective_posterior) {
+  ### Calculates the sequential learning gain for ever study
+  ### based on a sequence of collective posteriors
+  ### based on the Wasserstein-2 distance.
+  W2_seq <- NULL
+  for (i in 1:length(unique(collective_posterior$seq))) {
+    p1 <- collective_posterior$mu[collective_posterior$seq == i]
+    dist1 <- hist(p1, plot = FALSE, breaks = seq(-15, 15, 4 / 1000))$density
+    if (i == 1) {
+      p0 <- runif(100000, -2, 2)
+      dist0 <- hist(p0, plot = FALSE, breaks = seq(-15, 15, 4 / 1000))$density
+    }
+    else{
+      p0 <- collective_posterior$mu[collective_posterior$seq == (i - 1)]
+      dist0 <- hist(p0, plot = FALSE, breaks = seq(-15, 15, 4 / 1000))$density
+    }
+    w2 <- data.frame(w2 = transport::wasserstein1d(p1, p0, p = 2), seq = i)
+    W2_seq <- rbind(W2_seq, w2)
+  }
+  W2_seq
+}
+
+calculate_posterior_estimates <- function(collective_posterior) {
+  ### Calculates the posterior mean and the 95% credible interval
+  ### for a sequence of posteriors
+  posterior_est_seq <- NULL
+  for (i in 1:length(unique(collective_posterior$seq))) {
+    mu <- mean(collective_posterior$mu[collective_posterior$seq == i])
+    low <-
+      rstanarm::posterior_interval(matrix(collective_posterior$mu[collective_posterior$seq ==
+                                                                    i]))[1]
+    up <-
+      rstanarm::posterior_interval(matrix(collective_posterior$mu[collective_posterior$seq ==
+                                                                    i]))[2]
+    posterior_est_seq <-
+      rbind(posterior_est_seq, c(mu = mu, low = low, up = up))
+  }
+  data.frame(posterior_est_seq)
+}
+plot_data <- function(data) {
+  ### creates a data plot
+  ggplot(data) +
+    geom_point(aes(y = y, x = t), size = 0.5) +
+    geom_errorbar(aes(
+      x = t,
+      ymin = y - 1.96 * se,
+      ymax = y + 1.96 * se
+    ), width = 0) +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_blank(),
+      axis.line = element_line(colour = "black")
+    ) +
+    xlab("Sequence of Experiments") +
+    ylab("Experiment Outcome y")
+}
+plot_W2_seq <- function(W2_seq) {
+   ### creates a plot of the learning metric
+  ggplot(W2_seq %>% filter(seq > 0)) +
+    geom_line(aes(x = seq, y = w2)) +
+    geom_point(aes(x = seq, y = w2))  +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_blank(),
+      axis.line = element_line(colour = "black")
+    ) +
+    xlab("Sequence of Experiments") +
+    ylab("Contribution")
+}
+plot_estimate_seq <- function(estm_seq) {
+  ### creates a plot of the posterior and its uncertainty band
+  estm <- estm_seq
+  estm$t <- 1:length(estm$mu)
+  ggplot(estm, aes(x = t, y = mu)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = low, ymax = up),
+                alpha = 0.3,
+                fill = "steelblue") +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_blank(),
+      axis.line = element_line(colour = "black")
+    ) +
+    xlab("Sequence of Experiments") +
+    ylab("Posterior")
+}
+```
+
+### Many Labs
+```{r,warning=FALSE,message=FALSE}
+many_labs <- read.csv("data/many_labs_smat_dataset.csv")
+### get data into the right shape
+data <-
+  many_labs %>% group_by(referrer) %>% summarize(y = ate[1], se = se[1])
+data$t <- 1:length(data$referrer)
+data$method <- 1
+### create prior matrix
+prior <- matrix(rep(1e-4, length(data$t)))
+### run SMAT
+plot <- smat(data, prior)
+### plot the Trace
+gridExtra::grid.arrange(plot)
+```
+
+
+
+
+### Stylized Example
+
+```{r}
+create_data <- function(n, n_per_study) {
+  ### Creates the data for our Stylized Example Section
+  theta <- 1
+  beta <- 1
+  gamma <- .1
+  
+  eps <- rnorm(n, 0, 0.1)
+  
+  l <- rep(c(rep(1, n / 3), rep(-0, 2 * n / 3)), n_per_study)
+  
+  z <- l * beta + rep(eps, n_per_study)
+  
+  y <- theta + z + rnorm(n * n_per_study, 0, 0.1)
+  
+  t <- rep(1:n, n_per_study)
+  sim <-
+    data.frame(y = y ,
+               t = t,
+               method = c(rep(0, n / 3), rep(1, 2 * n / 3)))
+}
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+### Simulate Data
+n <- 30
+sim <- create_data(n,50)
+data <- sim %>% group_by(t) %>% summarize(se = sd(y),y = mean(y),method=method[1])
+
+### Add Method dummies to the data.frame
+data <- fastDummies::dummy_cols(
+  data,
+  select_columns = "method",
+  remove_first_dummy = FALSE,  # keep all m dummies
+  remove_selected_columns = FALSE
+)
+### Create Prior
+kappa <- 1
+s <- 1e-4
+prior <- rbind(
+matrix(c(kappa, s), nrow = 10, ncol = 2, byrow = TRUE),
+matrix(c(kappa,     s), nrow = 20, ncol = 2, byrow = TRUE))
+
+### run SMAT
+plot <- smat(data, prior)
+### plot the Trace
+gridExtra::grid.arrange(plot)
+```
+### Stylized Example with Change in Beliefs
+```{r,warning=FALSE,message=FALSE}
+### Create Prior that encodes Change in Belief
+kappa <- 1
+s <- 1e-4
+prior <- rbind(
+  matrix(c(s, s), nrow = 10, ncol = 2, byrow = TRUE),
+  matrix(c(kappa,     s), nrow = 20, ncol = 2, byrow = TRUE)
+)
+### run SMAT
+plot <- smat(data, prior)
+### plot the Trace
+gridExtra::grid.arrange(plot)
+```
+
+
+
